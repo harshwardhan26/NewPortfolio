@@ -1,0 +1,303 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>html,body{margin:0;background:transparent;overflow:hidden}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "/node_modules/three/build/three.module.js",
+  "three/addons/": "/node_modules/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+// Offline renderer, driven by scripts/render-m4.mjs. Never shipped to visitors.
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+
+const q = new URLSearchParams(location.search);
+const paint = q.get("paint");
+const paintMatch = new RegExp(q.get("match"), "i");
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setClearColor(0x000000, 0);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const key = new THREE.DirectionalLight(0xffffff, 2.2);
+key.castShadow = true;
+key.shadow.mapSize.set(4096, 4096);
+key.shadow.radius = 8;
+key.shadow.bias = -0.0005;
+scene.add(key, key.target);
+// Rim light from behind/above so the silhouette reads against a dark page.
+const rim = new THREE.DirectionalLight(0xffffff, 1.6);
+scene.add(rim, rim.target);
+
+const gltf = await new GLTFLoader().loadAsync(q.get("model"));
+const car = new THREE.Group();
+const model = gltf.scene;
+car.add(model);
+scene.add(car);
+
+const names = new Set();
+const meshes = [];
+model.traverse((o) => {
+  if (!o.isMesh) return;
+  o.castShadow = true;
+  meshes.push(o);
+  for (const m of [].concat(o.material)) {
+    names.add(m.name);
+    if (paint && paintMatch.test(m.name)) {
+      // Glossy metallic paint: deep base colour, flake metalness, near-mirror clearcoat.
+      m.color.set(paint);
+      m.metalness = 0.55;
+      m.roughness = 0.07;
+      m.envMapIntensity = 1.8; // strong, crisp reflections: showroom shine
+      if ("clearcoat" in m) { m.clearcoat = 1; m.clearcoatRoughness = 0.015; }
+    }
+    // Headlights, DRLs and tail lights on.
+    if (/emissive/i.test(m.name)) m.emissiveIntensity = +q.get("lights");
+  }
+});
+// Sharpest texture sampling at grazing angles (tyre lettering, disc drilling, rim edges).
+const aniso = renderer.capabilities.getMaxAnisotropy();
+for (const o of meshes)
+  for (const m of [].concat(o.material))
+    for (const k of ["map", "normalMap", "roughnessMap", "metalnessMap", "emissiveMap", "aoMap", "clearcoatNormalMap", "transmissionMap"])
+      if (m[k]) {
+        m[k].anisotropy = aniso;
+        m[k].needsUpdate = true;
+      }
+
+// Paint-only mask materials: paint renders white, everything else only occludes (no colour).
+const maskPaint = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const maskHide = new THREE.MeshBasicMaterial({ colorWrite: false });
+const original = new Map(meshes.map((o) => [o, o.material]));
+const setMask = (on) => {
+  for (const o of meshes) {
+    const m = original.get(o);
+    o.material = on ? ([].concat(m).some((x) => paintMatch.test(x.name)) ? maskPaint : maskHide) : m;
+  }
+};
+
+// Centre on the turntable axis and sit on the ground.
+const box = new THREE.Box3().setFromObject(model);
+const size = box.getSize(new THREE.Vector3());
+const centre = box.getCenter(new THREE.Vector3());
+model.position.set(-centre.x, -box.min.y, -centre.z);
+const len = Math.max(size.x, size.z);
+const longAxis = size.x >= size.z ? "x" : "z";
+
+// Which end is the front: the grille side.
+car.updateMatrixWorld(true);
+const grill = new THREE.Box3();
+model.traverse((o) => o.isMesh && /grill/i.test([].concat(o.material)[0].name) && grill.expandByObject(o));
+const front = Math.sign(grill.getCenter(new THREE.Vector3())[longAxis]) || 1;
+// Yaw that points the nose at screen-left (-x), seen from the camera on +z.
+const faceLeft = longAxis === "z" ? front * Math.PI / 2 : (front > 0 ? Math.PI : 0);
+
+// Wheel bones (skinned rims/tyres) and their rest pose.
+const wheels = [];
+model.traverse((o) => /3DWheel/i.test(o.name) && wheels.push({ bone: o, rest: o.quaternion.clone() }));
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(len * 8, len * 8), new THREE.ShadowMaterial({ opacity: 0.22 }));
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+const cam = new THREE.PerspectiveCamera(30, 1, len / 100, len * 20);
+key.position.set(len * 0.8, len * 2.2, len * 1.2);
+rim.position.set(-len * 0.4, len * 1.6, -len * 2);
+const s = len * 1.4;
+Object.assign(key.shadow.camera, { left: -s, right: s, top: s, bottom: -s, near: 0.1, far: len * 6 });
+key.shadow.camera.updateProjectionMatrix();
+
+const toViewer = new THREE.Vector3(0, 0, 1);
+const WHEEL = /rimRim|TireBlur/i; // rim + tyre materials (brake discs/calipers are not included)
+// Half tyre width (275 mm section): axle centre → outer sidewall. Scene units are not metres
+// (the model is scaled), so express it relative to the car's real 4.79 m length.
+const TYRE_HALF = len * (0.14 / 4.79);
+
+/**
+ * Render one frame.
+ * mode "side": nose left, wheels rolled by i/n of a full turn (counter-clockwise = driving left).
+ * mode "turn": turntable yaw = start + i/n · 360°, wheels at rest.
+ */
+// Supersampling: render at ss× then downscale with high-quality filtering for clean edges.
+const out = document.createElement("canvas");
+const octx = out.getContext("2d");
+
+const rollWheels = (roll) => {
+  // Axle points at the camera in side view; express that axis in each bone's parent space.
+  for (const { bone, rest } of wheels) {
+    const parentQ = bone.parent.getWorldQuaternion(new THREE.Quaternion()).invert();
+    const axis = toViewer.clone().applyQuaternion(parentQ);
+    bone.quaternion.copy(rest).premultiply(new THREE.Quaternion().setFromAxisAngle(axis, roll));
+  }
+};
+
+window.frame = ({ mode, i, n, w, h, elev, dist, start, quality, ss, blur = 0, samples = 1 }) => {
+  renderer.setSize(w * ss, h * ss);
+  cam.aspect = w / h;
+  cam.updateProjectionMatrix();
+  const e = THREE.MathUtils.degToRad(elev);
+  const d = len * dist;
+  cam.position.set(0, Math.sin(e) * d + size.y * 0.35, Math.cos(e) * d);
+  cam.lookAt(0, size.y * 0.42, 0);
+
+  const side = mode !== "turn";
+  car.rotation.y = side ? faceLeft : start + (i / n) * Math.PI * 2;
+  car.updateMatrixWorld(true);
+  out.width = w;
+  out.height = h;
+  octx.imageSmoothingEnabled = true;
+  octx.imageSmoothingQuality = "high";
+  octx.clearRect(0, 0, w, h);
+
+  // Body only: rims and tyres hidden (discs + calipers stay), for runtime-rotated wheel sprites.
+  if (mode === "body") {
+    rollWheels(0);
+    for (const o of meshes) if ([].concat(original.get(o)).some((x) => WHEEL.test(x.name))) o.visible = false;
+    renderer.render(scene, cam);
+    for (const o of meshes) o.visible = true;
+    octx.drawImage(renderer.domElement, 0, 0, w, h);
+    return out.toDataURL("image/webp", quality);
+  }
+
+  // Near-side rims + tyres only, cropped per wheel around its axle. With blur: average `samples`
+  // rolls across `blur` radians (a pre-blurred copy for speed).
+  // Near-side rims + tyres only, one sprite per wheel, rendered FACE-ON (camera on the axle,
+  // long lens) so the sprite is rotationally symmetric and can spin in place on the page without
+  // the perspective tread sliver rotating with it. Anchored/sized from the main camera's projection.
+  // With blur: average `samples` rolls across `blur` radians (a pre-blurred copy for speed).
+  if (mode === "wheels") {
+    const wheelMeshes = meshes.filter((o) => [].concat(original.get(o)).some((x) => WHEEL.test(x.name)));
+    for (const o of meshes) o.visible = wheelMeshes.includes(o);
+    ground.visible = false;
+    renderer.localClippingEnabled = true;
+    const near = [new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)]; // keep the camera side only
+    for (const o of wheelMeshes) for (const m of [].concat(o.material)) m.clippingPlanes = near;
+    const px = (v) => {
+      const p = v.clone().project(cam);
+      return { x: ((p.x + 1) / 2) * w, y: ((1 - p.y) / 2) * h };
+    };
+    const fov = 4;
+    const axleCam = new THREE.PerspectiveCamera(fov, 1, len / 100, len * 200);
+    const res = [];
+    rollWheels(0);
+    car.updateMatrixWorld(true);
+    cam.updateMatrixWorld(); // project() needs the current view matrix (normally set by render)
+    for (const { bone } of wheels) {
+      const c = bone.getWorldPosition(new THREE.Vector3());
+      if (c.z <= 0) continue;
+      // Anchor on the tyre's OUTER face (what the camera sees), not the axle centre: perspective
+      // pushes it outward/down on screen.
+      const face = c.clone().add(new THREE.Vector3(0, 0, TYRE_HALF));
+      const a = px(face), top = px(face.clone().add(new THREE.Vector3(0, c.y, 0)));
+      const r = Math.hypot(top.x - a.x, top.y - a.y); // tyre radius in output px (main view)
+      const half = Math.ceil(r * 1.08);
+      const halfWorld = c.y * 1.08; // wheel radius = axle height (tyre sits on the ground)
+      const D = halfWorld / Math.tan(THREE.MathUtils.degToRad(fov / 2));
+      axleCam.position.set(c.x, c.y, c.z + D);
+      axleCam.lookAt(c);
+      axleCam.near = D * 0.5;
+      axleCam.far = D * 1.5;
+      axleCam.updateProjectionMatrix();
+      const size = half * 2;
+      renderer.setSize(size * ss, size * ss);
+      const crop = document.createElement("canvas");
+      crop.width = crop.height = size;
+      const cctx = crop.getContext("2d");
+      cctx.imageSmoothingQuality = "high";
+      for (let k = 0; k < samples; k++) {
+        rollWheels(blur ? (k / samples) * blur : 0);
+        renderer.render(scene, axleCam);
+        cctx.globalAlpha = 1 / (k + 1); // running mean
+        cctx.drawImage(renderer.domElement, 0, 0, size, size);
+      }
+      res.push({ x: a.x, y: a.y, r, half, url: crop.toDataURL("image/webp", quality) });
+    }
+    for (const o of wheelMeshes) for (const m of [].concat(o.material)) m.clippingPlanes = null;
+    for (const o of meshes) o.visible = true;
+    ground.visible = true;
+    rollWheels(0);
+    return res.sort((p, q) => p.x - q.x); // [front (nose left), rear]
+  }
+
+  // Where each near wheel is visible past the body in the main view (white = visible), cropped
+  // like the sprites. Occluders are drawn FIRST (renderOrder) so they really hide the wheel.
+  if (mode === "wheel-mask") {
+    const wheelMeshes = meshes.filter((o) => [].concat(original.get(o)).some((x) => WHEEL.test(x.name)));
+    for (const o of meshes) {
+      const isWheel = wheelMeshes.includes(o);
+      o.material = isWheel ? maskPaint : maskHide;
+      o.renderOrder = isWheel ? 1 : -1;
+    }
+    ground.visible = false;
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.localClippingEnabled = true;
+    rollWheels(0);
+    renderer.render(scene, cam);
+    octx.drawImage(renderer.domElement, 0, 0, w, h);
+    setMask(false);
+    for (const o of meshes) o.renderOrder = 0;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    ground.visible = true;
+    cam.updateMatrixWorld();
+    const res = [];
+    for (const { bone } of wheels) {
+      const c = bone.getWorldPosition(new THREE.Vector3());
+      if (c.z <= 0) continue;
+      const face = c.clone().add(new THREE.Vector3(0, 0, TYRE_HALF));
+      const p = face.clone().project(cam), q = face.clone().add(new THREE.Vector3(0, c.y, 0)).project(cam);
+      const a = { x: ((p.x + 1) / 2) * w, y: ((1 - p.y) / 2) * h };
+      const r = Math.hypot(((q.x - p.x) / 2) * w, ((q.y - p.y) / 2) * h);
+      const half = Math.ceil(r * 1.08);
+      const crop = document.createElement("canvas");
+      crop.width = crop.height = half * 2;
+      crop.getContext("2d").drawImage(out, a.x - half, a.y - half, half * 2, half * 2, 0, 0, half * 2, half * 2);
+      res.push({ x: a.x, y: a.y, r, half, url: crop.toDataURL("image/png") });
+    }
+    return res.sort((p, q) => p.x - q.x);
+  }
+
+  if (mode === "mask") {
+    rollWheels(0);
+    ground.visible = false;
+    renderer.toneMapping = THREE.NoToneMapping;
+    setMask(true);
+    renderer.render(scene, cam);
+    setMask(false);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    ground.visible = true;
+    octx.drawImage(renderer.domElement, 0, 0, w, h);
+    return out.toDataURL("image/webp", quality);
+  }
+
+  // Wheel roll; with blur, average `samples` renders across `blur` radians (motion blur).
+  const base = side ? (i / n) * Math.PI * 2 * (blur ? n * blur / (Math.PI * 2) : 1) : 0;
+  for (let k = 0; k < samples; k++) {
+    rollWheels(side ? (blur ? (i * blur) + (k / samples) * blur : base) : 0);
+    renderer.render(scene, cam);
+    octx.globalAlpha = 1 / (k + 1); // running mean
+    octx.drawImage(renderer.domElement, 0, 0, w, h);
+  }
+  octx.globalAlpha = 1;
+  return out.toDataURL("image/webp", quality);
+};
+window.materials = [...names, `wheels: ${wheels.length}`];
+window.ready = true;
+</script>
+</body>
+</html>
